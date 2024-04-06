@@ -1,5 +1,4 @@
 import { BrowserContext, Page, Browser, chromium } from 'playwright';
-import sharp, { Sharp } from 'sharp';
 import * as path from 'path';
 import * as fs from 'fs';
 // import dotenv from 'dotenv';
@@ -150,10 +149,7 @@ export class BrowserController {
         return xmlMap;
     }
 
-    async takeScreenshot(): Promise<{
-        cap: Sharp | null;
-        xamlMap: string | null;
-    }> {
+    async takeScreenshot(): Promise<string | null> {
         await new Promise(resolve => setTimeout(resolve, 3000));
         // capture a screenshot with the hints on the screen
         const page = await this.getPage();
@@ -161,10 +157,7 @@ export class BrowserController {
         
         //get xmlMap
         const xmlMap = await this.applySom();
-        const buffer: Buffer = await page.screenshot();
-        return {
-            cap: sharp(buffer),
-            xamlMap: xmlMap
-        };
+        await page.screenshot({ path: 'screenshot.png' });
+        return xmlMap;
     }
 }

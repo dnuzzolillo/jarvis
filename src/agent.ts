@@ -5,7 +5,6 @@ import * as readline from 'readline';
 
 import { ChatCompletionContentPart, ChatCompletionCreateParamsNonStreaming, ChatCompletionMessageParam, ChatCompletionUserMessageParam } from 'openai/resources/chat';
 
-
 export interface Tool {
     toolDefinition: OpenAI.ChatCompletionTool;
     callback: (param: Record<string, string>) => Promise<void | string>;
@@ -16,9 +15,9 @@ export interface Selection {
     params: Record<string, string>;
 }
 
-export type AgentConfig = Partial<ReasoningStep>[];
+export type AgentConfig = Partial<ExecutionStep>[];
 
-export enum ReasoningStepFrequency {
+export enum StepFrequency {
     FIRST,
     MORE_THAN,
     LESS_THAN,
@@ -26,12 +25,24 @@ export enum ReasoningStepFrequency {
     EXCEPT
 }
 
-export interface ReasoningStep {
+export interface Step {
+    systemMessage: string;
+    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
+
+}
+
+export interface ThinkingStep {
+    systemMessage: string;
+    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
+
+}
+
+export type ExecutionStep = {
     tools: Tool[];
     userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
     model: string;
     curriculum: string;
-    frequency: ReasoningStepFrequency;
+    frequency: StepFrequency;
     frequencyParam: number;
 }
 
@@ -53,7 +64,7 @@ export class Agent {
     messagesHistory: ChatCompletionMessageParam[] = [];
     cachedPlan: string = '';
     userFeedbackEverySteps: number = 3;
-    reasoningSteps: ReasoningStep[] = [];
+    reasoningSteps: ExecutionStep[] = [];
     reasoningCycle: number = 0;
 
     constructor(config: AgentConfig) {
@@ -68,7 +79,7 @@ export class Agent {
             curriculum: "You are an AI assistant that can help with a variety of tasks.",
             userFeedbackEverySteps: Infinity,
             tools: [],
-            frequency: ReasoningStepFrequency.EVERY,
+            frequency: StepFrequency.EVERY,
             frequencyParam: 1,
             ...step
         }));
@@ -185,17 +196,17 @@ export class Agent {
         return await this.runTask(task);
     }
 
-    shouldSkipStep(step: ReasoningStep): boolean {
+    shouldSkipStep(step: ExecutionStep): boolean {
         switch (step.frequency) {
-            case ReasoningStepFrequency.FIRST:
+            case StepFrequency.FIRST:
                 return this.reasoningCycle !== 1;
-            case ReasoningStepFrequency.EVERY:
+            case StepFrequency.EVERY:
                 return this.reasoningCycle % step.frequencyParam !== 0;
-            case ReasoningStepFrequency.EXCEPT:
+            case StepFrequency.EXCEPT:
                 return this.reasoningCycle % step.frequencyParam === 0;
-            case ReasoningStepFrequency.LESS_THAN:
+            case StepFrequency.LESS_THAN:
                 return this.reasoningCycle >= step.frequencyParam;
-            case ReasoningStepFrequency.MORE_THAN:
+            case StepFrequency.MORE_THAN:
                 return this.reasoningCycle <= step.frequencyParam;
         }
     }
@@ -217,7 +228,7 @@ export class Agent {
         });
     }
 
-    getSystemPrompt(task: string, reasoningStep: ReasoningStep): string {
+    getSystemPrompt(task: string, reasoningStep: ExecutionStep): string {
         return `## Curriculum
         ${reasoningStep.curriculum}
                 
@@ -238,6 +249,7 @@ export class Agent {
         \`\`\`` : ''}
     `
     }
+
 }
 
 

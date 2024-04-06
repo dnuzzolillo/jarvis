@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { Agent, ReasoningStepFrequency, Tool } from '../agent';
+import { Agent, StepFrequency, Tool } from '../agent';
 import { BrowserController } from '../browser';
 import { ChatCompletionContentPart } from 'openai/resources/chat';
 
@@ -26,7 +26,7 @@ export class BrowserNavigatorAgent extends Agent {
             // Step 1 navigate to initial URL
             {
                 curriculum: `You are an AI agent who's job is to operate a web browser, you are given a task to perform. you must navigate to the URL you think is the best to perform the task.`,
-                frequency: ReasoningStepFrequency.FIRST,
+                frequency: StepFrequency.FIRST,
                 tools: [
                     {
                         toolDefinition: {
@@ -65,7 +65,7 @@ export class BrowserNavigatorAgent extends Agent {
             Every 3 steps, you should ask the user for feedback on the task you are performing
             
             - When you need to login, ask the user to do so and then continue with the task`,
-            frequency: ReasoningStepFrequency.EVERY,
+            frequency: StepFrequency.EVERY,
             tools: [
                 {
                     toolDefinition: {
@@ -249,23 +249,19 @@ export class BrowserNavigatorAgent extends Agent {
 
             ],
             userMessageFactory: async (task: string) => {
-                const { cap, xamlMap } = await this.browser.takeScreenshot();
-                if (cap) {
-                    await cap.toFile('screenshot.png');
-                    const base64: any = await this.imageToBase64('screenshot.png');
-                    const userMessage: Array<ChatCompletionContentPart> = [
-                        {
-                            "type": "image_url",
-                            "image_url": base64,
-                        },
-                        {
-                            "type": "text",
-                            "text": `UI map: ${xamlMap}`,
-                        }
-                    ]
-                    return userMessage;
-                }
-                throw new Error('No screenshot');
+                const xamlMap = await this.browser.takeScreenshot();
+                const base64: any = await this.imageToBase64('screenshot.png');
+                const userMessage: Array<ChatCompletionContentPart> = [
+                    {
+                        "type": "image_url",
+                        "image_url": base64,
+                    },
+                    {
+                        "type": "text",
+                        "text": `UI map: ${xamlMap}`,
+                    }
+                ]
+                return userMessage;
             }
         },
 
