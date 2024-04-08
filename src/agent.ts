@@ -1,4 +1,3 @@
-import { config } from 'dotenv';
 import fs from 'fs';
 import OpenAI from 'openai';
 import * as readline from 'readline';
@@ -15,7 +14,12 @@ export interface Selection {
     params: Record<string, string>;
 }
 
-export type AgentConfig = Partial<ExecutionStep>[];
+export enum StepType {
+    THINKING,
+    EXECUTION
+}
+
+export type AgentConfig = (Partial<Step> & {stepType: StepType})[];
 
 export enum StepFrequency {
     FIRST,
@@ -25,30 +29,36 @@ export enum StepFrequency {
     EXCEPT
 }
 
-export interface Step {
-    systemMessage: string;
-    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
-
-}
-
-export interface ThinkingStep {
-    systemMessage: string;
-    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
-
-}
-
-export type ExecutionStep = {
-    tools: Tool[];
+export type StepBase = {
     userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
     model: string;
-    curriculum: string;
     frequency: StepFrequency;
     frequencyParam: number;
+    stepType: StepType;
+    systemMessage: string | StructuredSystemPrompt;
+}
+
+export type ThinkingStep = StepBase & {
+    stepType: StepType.THINKING;
+}
+
+export type ExecutionStep = StepBase & {
+    tools: Tool[];
+    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
+    stepType: StepType.EXECUTION;
+}
+
+export type Step = ThinkingStep | ExecutionStep;
+
+export interface StructuredSystemPrompt {
+    [key: string]: string | StructuredSystemPrompt | string[];
 }
 
 export class Agent {
 
-    static client = new OpenAI();
+    static client = new OpenAI({
+        baseURL: process.env.OPENAI_API_BASE_URL || null,
+    });
 
     static extractJsonFromString(input: string): string {
         const regex = /```json\s*([\s\S]*?)\s*```/;
@@ -63,12 +73,15 @@ export class Agent {
     selectionHistory: Selection[] = [];
     messagesHistory: ChatCompletionMessageParam[] = [];
     cachedPlan: string = '';
-    userFeedbackEverySteps: number = 3;
-    reasoningSteps: ExecutionStep[] = [];
+    steps: Step[] = [];
     reasoningCycle: number = 0;
 
     constructor(config: AgentConfig) {
-        this.reasoningSteps = config.map(step => ({
+        this.steps = config.map(this.getStepFromPartial.bind(this));
+    }
+
+    getStepBaseFromPartial(partial: Partial<StepBase> & { stepType: StepType }): StepBase {
+        return {
             userMessageFactory: (t: string) => Promise.resolve([
                 {
                     "type": "text",
@@ -76,20 +89,45 @@ export class Agent {
                 }
             ]),
             model: "gpt-4-vision-preview",
-            curriculum: "You are an AI assistant that can help with a variety of tasks.",
-            userFeedbackEverySteps: Infinity,
-            tools: [],
             frequency: StepFrequency.EVERY,
             frequencyParam: 1,
-            ...step
-        }));
+            systemMessage: '',
+            ...partial
+        };
     }
 
-    isVisionModel(modelName: string) {
-        return modelName === "gpt-4-vision-preview";
+    getExecutionStepFromPartial(partial: Partial<ExecutionStep> & { stepType: StepType.EXECUTION }): ExecutionStep {
+        return {
+            ...this.getStepBaseFromPartial(partial),
+            systemMessage: "You are an AI assistant that can help with a variety of tasks.",
+            tools: [],
+            ...partial
+        };
+    }
+
+    getThinkingStepFromPartial(partial: Partial<ThinkingStep> & { stepType: StepType.THINKING }): ThinkingStep {
+        return {
+            ...this.getStepBaseFromPartial(partial),
+            systemMessage: '',
+            ...partial
+        };
+    }
+
+    getStepFromPartial(partial: Partial<Step>): Step {
+        if (partial.stepType === StepType.EXECUTION) {
+            return this.getExecutionStepFromPartial(partial as Partial<ExecutionStep> & { stepType: StepType.EXECUTION });
+        } else {
+            return this.getThinkingStepFromPartial(partial as Partial<ThinkingStep> & { stepType: StepType.THINKING });
+        }
+    }
+
+
+    allowsFunctionCalling(modelName: string) {
+        return modelName !== "gpt-4-vision-preview";
     }
 
     resolveToolSelection: (res: OpenAI.ChatCompletion, selectFromString: boolean) => Selection = (response: OpenAI.ChatCompletion, selectFromString: boolean) => {
+
         const tollCalls = selectFromString
         ? JSON.parse(Agent.extractJsonFromString(response.choices[0]?.message.content || 'undefined'))
         : response.choices[0]?.message.tool_calls?.[0].function;
@@ -118,85 +156,94 @@ export class Agent {
 
     async runTask(task: string): Promise<void> {
         this.reasoningCycle++;
-        for(const step of this.reasoningSteps) {
+        for(const step of this.steps) {
 
             if (this.shouldSkipStep(step)) {
                 continue;
             }
 
-            const userMessage: ChatCompletionMessageParam  = {
-                role: "user",
-                content: await step.userMessageFactory(task)
-            };
-            
-            const request: ChatCompletionCreateParamsNonStreaming = {
-                model: step.model,
-                messages: [
-                    {
-                        role: "system",
-                        content: this.getSystemPrompt(task, step)
-                    },
-                    ...this.messagesHistory.map((m: ChatCompletionMessageParam) => {
-                        // remove non-text content from user messages
-                        if (m.role === 'user' && Array.isArray(m.content)) {
-                            return {
-                                role: m.role,
-                                content: m.content.filter(c => c.type === 'text')
-                            }
-                        }
-                        return m;
-                    }),
-                    ...(userMessageGenerated => {
-                        if(userMessage.content.length) {
-                            return [userMessageGenerated];
-                        }
-                        return [];
-                    })(userMessage)
-                ],
-                max_tokens: 1000,
-                temperature: 0.3
-            };
-    
-            if (!this.isVisionModel(step.model)) {
-                request.tools = step.tools.map(t => t.toolDefinition);
-            }
-            console.log('Sending request');
-            const response = await Agent.client.chat.completions.create(request);
-
-            if(!step.tools.length) {
-                this.messagesHistory.push({
-                    role: "assistant",
-                    content: response.choices[0]?.message.content
-                });
-                console.log('Assistant:', response.choices[0]?.message.content);
-                continue;
-            }
-
-            const selection = this.resolveToolSelection(response, this.isVisionModel(step.model as string));
-            const tool = step.tools.find(tool => tool.toolDefinition.function.name === selection.actionName);
-            if (tool) {
-                this.messagesHistory.push({
-                    role: "assistant",
-                    content: JSON.stringify(selection)
-                });
-                if (selection.actionName === 'finish') {
-                    console.log('Task completed');
-                    console.log('/////////////////////////////');
-                    this.selectionHistory = [];
-                    const fs = require('fs');
-                    fs.writeFileSync('output.json', JSON.stringify(this.messagesHistory, null, 2));
-                    return;
-                }
-                console.log('Executing tool', `${tool.toolDefinition.function.name}(${JSON.stringify(selection.params)})`)
-                await tool.callback(selection.params);
+            if (step.stepType === StepType.EXECUTION) {
+                await this.runExecutionStep(step, task);
             } else {
-                console.log('No tool found for', response.choices[0]?.message.content);
+                console.log('Not implemented yet');
             }
+          
         }
         return await this.runTask(task);
     }
 
-    shouldSkipStep(step: ExecutionStep): boolean {
+    async runExecutionStep(step: ExecutionStep, task: string): Promise<void> {
+        const userMessage: ChatCompletionMessageParam  = {
+            role: "user",
+            content: await step.userMessageFactory(task)
+        };
+        
+        const request: ChatCompletionCreateParamsNonStreaming = {
+            model: step.model,
+            messages: [
+                {
+                    role: "system",
+                    content: this.getSystemPrompt(task, step)
+                },
+                ...this.messagesHistory.map((m: ChatCompletionMessageParam) => {
+                    // remove non-text content from user messages
+                    if (m.role === 'user' && Array.isArray(m.content)) {
+                        return {
+                            role: m.role,
+                            content: m.content.filter(c => c.type === 'text')
+                        }
+                    }
+                    return m;
+                }),
+                ...(userMessageGenerated => {
+                    if(userMessage.content.length) {
+                        return [userMessageGenerated];
+                    }
+                    return [];
+                })(userMessage)
+            ],
+            max_tokens: 1000,
+            temperature: 0.3
+        };
+
+        if (this.allowsFunctionCalling(step.model)) {
+            request.tools = step.tools.map(t => t.toolDefinition);
+        }
+        console.log('Sending request');
+        const response = await Agent.client.chat.completions.create(request);
+
+        if(!step.tools.length) {
+            this.messagesHistory.push({
+                role: "assistant",
+                content: response.choices[0]?.message.content
+            });
+            console.log('Assistant:', response.choices[0]?.message.content);
+            return;
+        }
+
+        const selection = this.resolveToolSelection(response, !this.allowsFunctionCalling(step.model as string));
+        const tool = step.tools.find(tool => tool.toolDefinition.function.name === selection.actionName);
+        if (tool) {
+            this.messagesHistory.push({
+                role: "assistant",
+                content: JSON.stringify(selection)
+            });
+            if (selection.actionName === 'finish') {
+                console.log('Task completed');
+                console.log('/////////////////////////////');
+                this.selectionHistory = [];
+                const fs = require('fs');
+                fs.writeFileSync('output.json', JSON.stringify(this.messagesHistory, null, 2));
+                return;
+            }
+            console.log('Executing tool', `${tool.toolDefinition.function.name}(${JSON.stringify(selection.params)})`)
+            await tool.callback(selection.params);
+        } else {
+            console.log('No tool found for', response.choices[0]?.message.content);
+        }
+    }
+
+    shouldSkipStep(step: Step): boolean {
         switch (step.frequency) {
             case StepFrequency.FIRST:
                 return this.reasoningCycle !== 1;
@@ -228,15 +275,34 @@ export class Agent {
         });
     }
 
-    getSystemPrompt(task: string, reasoningStep: ExecutionStep): string {
-        return `## Curriculum
-        ${reasoningStep.curriculum}
+    getStructuredMdContent(structuredContent: StructuredSystemPrompt, depth: number = 1): string {
+        const MAX_DEPTH = 3;
+        let content = '';
+
+        for (const key in structuredContent) {
+            const value = structuredContent[key];
+            if (typeof value === 'string') {
+                content += `${'#'.repeat(depth > MAX_DEPTH ? MAX_DEPTH : depth)} ${key}\n`;
+                content += (() => {
+                    if (typeof value === 'object') {
+                        return Array.isArray(value) ? (value as string[]).map((v, i) => `${i + 1}. ${v}`).join('\n') : this.getStructuredMdContent(value as StructuredSystemPrompt, depth + 1);
+                    }
+                })()
+            } else {
                 
+            }
+        }
+        return content;
+    }
+
+    getSystemPrompt(task: string, step: ExecutionStep): string {
+        return `${typeof step.systemMessage === 'string' ? step.systemMessage : this.getStructuredMdContent(step.systemMessage as StructuredSystemPrompt)}
+
         ## Given task
         ${task}
                 
-        ${this.isVisionModel(reasoningStep.model) && reasoningStep.tools.length ? `## You can use the following tools to complete the task
-        ${JSON.stringify(reasoningStep.tools, null, 2) }
+        ${(!this.allowsFunctionCalling(step.model)) && step.tools.length ? `## You can use the following tools to complete the task
+        ${JSON.stringify(step.tools, null, 2) }
         
         Only respond using function calling as a JSON object, for example:
         \`\`\`json

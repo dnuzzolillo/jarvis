@@ -129,32 +129,37 @@ export class BrowserController {
     }
 
     async applySom() {
-        const page = await this.getPage();
-        //inject style
-        const style = fs.readFileSync(__dirname + '/som.css', 'utf8');
-        await page.addStyleTag({ content: style });
-        //inject script
-        const scriptContent = fs.readFileSync(__dirname + '/som.js', 'utf8');
-        await page.evaluate(script => eval(script), scriptContent);
+        let attempts = 0;
+        while (attempts < 3) {
+            try {
+                const page = await this.getPage();
+                //inject style
+                const style = fs.readFileSync(__dirname + '/som.css', 'utf8');
+                await page.addStyleTag({ content: style });
+                //inject script
+                const scriptContent = fs.readFileSync(__dirname + '/som.js', 'utf8');
+                await page.evaluate(script => eval(script), scriptContent);
 
-        const xmlMap = await page.evaluate(() => {
-            const xmlMap = (window as any).xmlMap;
-            return xmlMap;
-        });
+                const xmlMap = await page.evaluate(() => {
+                    const xmlMap = (window as any).xmlMap;
+                    return xmlMap;
+                });
 
-        this.jsonMap = await page.evaluate(() => {
-            const jsonMap = (window as any).jsonMap;
-            return jsonMap;
-        });
-        return xmlMap;
+                this.jsonMap = await page.evaluate(() => {
+                    const jsonMap = (window as any).jsonMap;
+                    return jsonMap;
+                });
+                return xmlMap;
+            } catch (error) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                attempts++;
+            }
+        }
+        
     }
 
     async takeScreenshot(): Promise<string | null> {
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        // capture a screenshot with the hints on the screen
         const page = await this.getPage();
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        
         //get xmlMap
         const xmlMap = await this.applySom();
         await page.screenshot({ path: 'screenshot.png' });
