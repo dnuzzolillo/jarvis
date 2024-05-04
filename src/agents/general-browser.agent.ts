@@ -2,30 +2,65 @@ import fs from 'fs';
 import { Agent, StepFrequency, StepType, Tool } from '../agent';
 import { BrowserController } from '../browser';
 import { ChatCompletionContentPart } from 'openai/resources/chat';
+import { RelevantDataCollectorAgent } from './user-data-collector.agent';
+import { getBrwoserCrawlingTools } from './steps/tools';
 
-const stepAnalysisPropDefinition = {
-    analysis: {
-        type: "string",
-        description: "Create a brief analysis of what you learned from the screenshot",
-    },
-    expectedResults: {
-        type: "string",
-        description: "What are the expected results of this action?",
-    }
+export enum BrowserTaskType {
+    CRAWL = 'CRAWL',
+    OBSERVE = 'OBSERVE',
+    FILL_FORM = 'FILL_FORM',
 }
 
-export class BrowserNavigatorAgent extends Agent {
+
+export class BrowserAgent extends Agent {
     browser: BrowserController = new BrowserController();
 
     constructor() {
-        super([
-            // Step 1 navigate to initial URL
+        super([]);
+        this.setUpConfig([
+            // {
+            //     stepType: StepType.THINKING,
+            //     model: 'gpt-4-turbo-2024-04-09',
+            //     systemMessage: {
+            //         role: `You are an AI agent who reason about the task you are given to perform using the web browser.`,
+            //         'How you operate': `You have to analyze the given task and answer: What information do i need to be precise in the execution this task?`,
+            //         'response format': `You must provide a list of information you need to be precise in the execution of the task.`
+            //     },
+            //     callback: async (response: string) => {
+            //         const relevantDataCollector: RelevantDataCollectorAgent = new RelevantDataCollectorAgent();
+            //         const premisesObj = await relevantDataCollector.runTask<Record<string, string>>(response) || {};
+            //         this.updateStructuredContent({
+            //             premises: {
+            //                 ...premisesObj
+            //             }
+            //         });
+            //     },
+            // },
             {
-                stepType: StepType.EXECUTION,
-                systemMessage: {
-                    curriculum: `You are an AI agent who's job is to operate a web browser, you are given a task to perform. you must navigate to the URL you think is the best to perform the task.`,
-                },
+                stepType: StepType.THINKING,
                 frequency: StepFrequency.FIRST,
+                model: 'gpt-4-turbo-2024-04-09',
+                systemMessage: {
+                    role: `You are an AI agent who reason about the task you are given to perform using the web browser.`,
+                    'How you operate': `You have to analyze the given task and answer: What steps do i need to take to perform this task?`,
+                    'Task': `Perform the following task: {{task}}`,
+                },
+                callback: (response: string) => {
+                    console.log('plan', response)
+                    this.updateRecords({
+                        plan: response
+                    })
+                },
+            },
+            {
+                systemMessage: {
+                    role: `You are an AI agent who's job is to operate a web browser, you are given a task to perform. you must navigate to the URL you think is the best to perform the task.`,
+                    'How you should perform the task': `Perform the following task: {{plan}}`,
+                    'Task': `Perform the following task: {{task}}`,
+                },
+                stepType: StepType.EXECUTION,
+                frequency: StepFrequency.IF,
+                frequencyParam: () => !this.browser.page,
                 tools: [
                     {
                         toolDefinition: {
@@ -40,9 +75,8 @@ export class BrowserNavigatorAgent extends Agent {
                                             type: "string",
                                             description: "URL to navigate to",
                                         },
-                                        ...stepAnalysisPropDefinition
                                     },
-                                    required: ['url', 'analysis']
+                                    required: ['url']
                                 }
                             }
                         },
@@ -54,207 +88,21 @@ export class BrowserNavigatorAgent extends Agent {
             },
             {
                 stepType: StepType.EXECUTION,
-
                 systemMessage: {
-                    role: `You are an AI agent who's job is to operate a web browser while being supervised by a human.
-                    You are given a screenshot of the browser, and you must use the screenshot to what elements to interact with.
-                    To interact with elements, use the tools and the hints placed each element.
-                    When you are not sure what to do, you can ask the user for help.`,
+                    role: `You are an AI agent who's job is to operate a web browser while being supervised.
+You are given a screenshot of the browser, and you must use the screenshot to what elements to interact with.
+To interact with elements, use the tools and the hints placed each element.`,
+                    'How you should perform the task': `Perform the following task: {{plan}}`,
                     notes: [
-                        `Please interact with the user as mutch as possible to learn from the user's feedback. Every 3 steps, you should ask the user for feedback on the task you are performing.`,
                         `When you need to login, ask the user to do so and then continue with the task`,
-                    ]
+                        `Pay special attention to avoid to repeat actions that are already done`,
+                        `Try to scroll down if you can't find the element you are looking for`,
+                    ],
+                    'Task': `Perform the following task: {{task}}`,
                 },
                 frequency: StepFrequency.EVERY,
                 tools: [
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'finish',
-                                description: 'Finish the given task',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        afterthoughts: {
-                                            type: "string",
-                                            description: "Create an afterthoughts of the task you performed describing the steps you took. What did you learn? What would you do differently next time?",
-                                        },
-                                        conclusion: {
-                                            type: "string",
-                                            description: "What is the conclusion of the task you performed?",
-                                        },
-                                        success: {
-                                            type: "boolean",
-                                            description: "Was the task successful?",
-                                        }
-                                    },
-                                    required: ['afterthoughts', 'conclusion', 'success']
-                                },
-                            }
-
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            console.log(`Finished: ${params.finishReason}`);
-                        }
-                    },
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'navigate',
-                                description: 'Navigate to the given URL',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        url: {
-                                            type: "string",
-                                            description: "URL to navigate to",
-                                        },
-                                        ...stepAnalysisPropDefinition
-                                    },
-                                    required: ['url', 'analysis']
-                                }
-                            }
-
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            await this.browser.navigate(params.url);
-                        }
-                    },
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'click',
-                                description: 'Click on element',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        element_id: {
-                                            type: "string",
-                                            description: "Use the hint (placed in the top left corner of the element) to specify the character string to click on",
-                                        },
-                                        ...stepAnalysisPropDefinition
-                                    },
-                                    required: ['element_id', 'analysis']
-                                }
-                            }
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            await this.browser.click(params.element_id);
-                        }
-                    },
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'type',
-                                description: '',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        text: {
-                                            type: "string",
-                                            description: "Text to type",
-                                        },
-                                        element_id: {
-                                            type: "string",
-                                            description: "The character string to focus on",
-                                        },
-                                        press_enter: {
-                                            type: "boolean",
-                                            description: "Press enter after typing the text (useful for search boxes)",
-                                        },
-                                        ...stepAnalysisPropDefinition
-                                    },
-                                    required: ['text', 'element_id', 'analysis']
-                                }
-                            }
-
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            await this.browser.type(params.element_id, params.text, params.press_enter as any);
-                        }
-                    },
-                    // scroll
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'scroll',
-                                description: 'Scroll up or down',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        direction: {
-                                            type: "string",
-                                            description: "Direction to scroll",
-                                        },
-                                        ...stepAnalysisPropDefinition
-                                    },
-                                    required: ['direction', 'analysis']
-
-                                }
-                            }
-
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            await this.browser.scroll(params.direction as 'up' | 'down');
-                        }
-                    },
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'go_back',
-                                description: 'Go back to the previous page',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        times: {
-                                            type: "number",
-                                            description: "Number of times to go back",
-                                        },
-                                    }
-                                }
-                            }
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            const times = parseInt(params.times);
-                            for (let i = 0; i < times; i++) {
-                                await this.browser.page?.goBack();
-                            }
-                        }
-
-                    },
-                    {
-                        toolDefinition: {
-                            type: 'function',
-                            function: {
-                                name: 'prompt_user',
-                                description: 'Prompt the user with a message',
-                                parameters: {
-                                    type: "object",
-                                    properties: {
-                                        prompt: {
-                                            type: "string",
-                                            description: "Prompt to show to the user",
-                                        },
-                                    },
-                                    required: ['prompt']
-                                }
-                            },
-                        },
-                        callback: async (params: Record<string, string>) => {
-                            const userInput: string = await this.promptUserWithCmd(params.prompt);
-                            this.messagesHistory.push({
-                                role: "user",
-                                content: userInput
-                            });
-                        }
-                    }
-
+                    ...getBrwoserCrawlingTools(this.browser)
                 ],
                 userMessageFactory: async (task: string) => {
                     const xamlMap = await this.browser.takeScreenshot();
@@ -266,6 +114,10 @@ export class BrowserNavigatorAgent extends Agent {
                         },
                         {
                             "type": "text",
+                            "text": `current url: ${this.browser.page?.url()}`,
+                        },
+                        {
+                            "type": "text",
                             "text": `UI map: ${xamlMap}`,
                         }
                     ]
@@ -273,9 +125,29 @@ export class BrowserNavigatorAgent extends Agent {
                 }
             },
 
+            {
+                stepType: StepType.THINKING,
+                systemMessage: {
+                    role: `You are supervising the AI agent who is operating a web browser.`
+                    +`Your job is to analyze the previous steps taken by the AI agent and`
+                    +`check if the the AI is performing the task correctly according to the given plan.`
+                    +`And provide feedback to the AI agent.`,
+                    'Detect loops': `If the AI agent is repeating the same actions, you should provide feedback to the AI agent.`,
+                    'Task': `The AI agent is performing the following task: {{task}}`,
+                    'Response format': `Explain concisely what the AI agent is doing wrong and what the AI agent should do instead.`,
+                },
+                model: 'gpt-4-turbo-2024-04-09',
+                frequency: StepFrequency.EVERY,
+                frequencyParam: 3,   
+                callback: async (response: string) => {
+                    console.log('feedback', response);
+                    this.messagesHistory.push({
+                        role: 'user',
+                        content: 'Feedback: '+response
+                    });
+                }
+            }
         ]);
-
-
     }
 
     async imageToBase64(image_file: any) {
@@ -298,7 +170,6 @@ export class BrowserNavigatorAgent extends Agent {
         const task: string = await this.promptUserWithCmd('What task would you like to perform?');
         await this.runTask(task);
     }
-
 
 }
 

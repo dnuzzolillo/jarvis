@@ -3,10 +3,12 @@ import OpenAI from 'openai';
 import * as readline from 'readline';
 
 import { ChatCompletionContentPart, ChatCompletionCreateParamsNonStreaming, ChatCompletionMessageParam, ChatCompletionUserMessageParam } from 'openai/resources/chat';
+import { openaiClient } from './openai-client';
+import { VectorMemory } from './memory';
 
 export interface Tool {
     toolDefinition: OpenAI.ChatCompletionTool;
-    callback: (param: Record<string, string>) => Promise<void | string>;
+    callback: (param: Record<string, string>) => Promise<any>;
 }
 
 export interface Selection {
@@ -19,46 +21,63 @@ export enum StepType {
     EXECUTION
 }
 
-export type AgentConfig = (Partial<Step> & {stepType: StepType})[];
+export type AgentConfig = (Partial<Step> & { stepType: StepType })[];
 
 export enum StepFrequency {
     FIRST,
     MORE_THAN,
     LESS_THAN,
     EVERY,
-    EXCEPT
+    EXCEPT,
+    IF
 }
 
 export type StepBase = {
-    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
+    userMessageFactory?: (t: string) => Promise<ChatCompletionContentPart[]>;
+    appendUserMessage?: () => boolean;
     model: string;
-    frequency: StepFrequency;
-    frequencyParam: number;
     stepType: StepType;
-    systemMessage: string | StructuredSystemPrompt;
-}
+    systemMessage: string | (StructuredContent );
+} & (
+    {
+        frequency: StepFrequency.FIRST | StepFrequency.MORE_THAN | StepFrequency.LESS_THAN | StepFrequency.EVERY | StepFrequency.EXCEPT;
+        frequencyParam: number;
+    } | {
+        frequency: StepFrequency.IF;
+        frequencyParam: () => boolean;
+    }
+);
 
 export type ThinkingStep = StepBase & {
     stepType: StepType.THINKING;
+    callback: (responseContent: string) => any;
 }
 
 export type ExecutionStep = StepBase & {
     tools: Tool[];
-    userMessageFactory: (t: string) => Promise<ChatCompletionContentPart[]>;
     stepType: StepType.EXECUTION;
 }
 
 export type Step = ThinkingStep | ExecutionStep;
 
-export interface StructuredSystemPrompt {
-    [key: string]: string | StructuredSystemPrompt | string[];
+export interface StructuredContent {
+    [key: string]: string | StructuredContent | string[];
+}
+
+export enum FeedbackType {
+    POSITIVE = 'positive',
+    NEGATIVE = 'negative',
+    NEUTRAL = 'neutral'
+}
+
+export interface Feedback {
+    feedback: string;
+    feedbackType: string;
 }
 
 export class Agent {
 
-    static client = new OpenAI({
-        baseURL: process.env.OPENAI_API_BASE_URL || null,
-    });
+    static client = openaiClient;
 
     static extractJsonFromString(input: string): string {
         const regex = /```json\s*([\s\S]*?)\s*```/;
@@ -69,31 +88,36 @@ export class Agent {
             return input;
         }
     }
-    
-    selectionHistory: Selection[] = [];
+
     messagesHistory: ChatCompletionMessageParam[] = [];
-    cachedPlan: string = '';
+    records: Record<string, string> = {};
+    memoryChunks: string[] = [];
     steps: Step[] = [];
     reasoningCycle: number = 0;
+    stop: boolean = false;
+    currentTask: string = '';
+    feedbackHistory: Feedback[] = [];
+    vectorMemory: VectorMemory = new VectorMemory();
+    lastExecutedToolName: string = '';
+    defaultModel: string = 'gpt-4-turbo-2024-04-09';
 
     constructor(config: AgentConfig) {
+        this.setUpConfig(config);
+    }
+
+    setUpConfig(config: AgentConfig) {
         this.steps = config.map(this.getStepFromPartial.bind(this));
     }
 
     getStepBaseFromPartial(partial: Partial<StepBase> & { stepType: StepType }): StepBase {
         return {
-            userMessageFactory: (t: string) => Promise.resolve([
-                {
-                    "type": "text",
-                    "text": t,
-                }
-            ]),
             model: "gpt-4-vision-preview",
             frequency: StepFrequency.EVERY,
             frequencyParam: 1,
             systemMessage: '',
+            appendUserMessage: () => true,
             ...partial
-        };
+        } as StepBase;
     }
 
     getExecutionStepFromPartial(partial: Partial<ExecutionStep> & { stepType: StepType.EXECUTION }): ExecutionStep {
@@ -102,15 +126,16 @@ export class Agent {
             systemMessage: "You are an AI assistant that can help with a variety of tasks.",
             tools: [],
             ...partial
-        };
+        } as ExecutionStep;
     }
 
     getThinkingStepFromPartial(partial: Partial<ThinkingStep> & { stepType: StepType.THINKING }): ThinkingStep {
         return {
             ...this.getStepBaseFromPartial(partial),
             systemMessage: '',
+            callback: async () => { },
             ...partial
-        };
+        } as ThinkingStep;
     }
 
     getStepFromPartial(partial: Partial<Step>): Step {
@@ -126,102 +151,132 @@ export class Agent {
         return modelName !== "gpt-4-vision-preview";
     }
 
-    resolveToolSelection: (res: OpenAI.ChatCompletion, selectFromString: boolean) => Selection = (response: OpenAI.ChatCompletion, selectFromString: boolean) => {
+    resolveToolSelection: (res: OpenAI.ChatCompletion, selectFromString: boolean) => Selection | undefined = (response: OpenAI.ChatCompletion, selectFromString: boolean) => {
+        try {
+            const tollCalls = response.choices[0]?.message.tool_calls?.[0].function ?? JSON.parse(Agent.extractJsonFromString(response.choices[0]?.message.content || 'undefined'));
+            if(!tollCalls) {
+                return undefined;
+            }
+            const params = typeof (tollCalls.arguments || tollCalls.params) === 'string' ? JSON.parse(tollCalls.arguments || tollCalls.params) : tollCalls.arguments || tollCalls.params;
+            return {
+                actionName: tollCalls.name || tollCalls.actionName,
+                params
+            };
+        } catch (error) {
+            console.log('Error resolving tool selection', response.choices[0]?.message.content, error);
+            return undefined;
+        }
+    }
 
-        const tollCalls = selectFromString
-        ? JSON.parse(Agent.extractJsonFromString(response.choices[0]?.message.content || 'undefined'))
-        : response.choices[0]?.message.tool_calls?.[0].function;
-
-        return {
-            actionName: tollCalls.name || tollCalls.actionName,
-            params: tollCalls.arguments || tollCalls.params
+    updateRecords(records: Record<string, string>) {
+        this.records = {
+            ...this.records,
+            ...records
         };
     }
 
-    async imageToBase64(image_file: any) {
-        return await new Promise((resolve, reject) => {
-            fs.readFile(image_file, (err, data) => {
-                if (err) {
-                    console.error('Error reading the file:', err);
-                    reject();
-                    return;
-                }
-
-                const base64Data = data.toString('base64');
-                const dataURI = `data:image/png;base64,${base64Data}`;
-                resolve(dataURI);
-            });
-        });
+    async runFromCli() {
+        const task = await this.promptUserWithCmd('What is the task you want to perform?');
+        await this.runTask(task);
     }
 
-    async runTask(task: string): Promise<void> {
+    async runTask<T>(task: string): Promise<T | undefined> {
+        this.currentTask = task;
         this.reasoningCycle++;
-        for(const step of this.steps) {
-
+        for (const step of this.steps) {
             if (this.shouldSkipStep(step)) {
                 continue;
             }
-
             if (step.stepType === StepType.EXECUTION) {
-                await this.runExecutionStep(step, task);
+                const result: T = await this.runExecutionStep(step, task);
+                if (result) {
+                    return result;
+                }
             } else {
-                console.log('Not implemented yet');
+                await this.runThinkingStep(step, task);
             }
-          
+
         }
-        return await this.runTask(task);
+        return this.runTask(task);
     }
 
-    async runExecutionStep(step: ExecutionStep, task: string): Promise<void> {
-        const userMessage: ChatCompletionMessageParam  = {
-            role: "user",
-            content: await step.userMessageFactory(task)
-        };
-        
+    async runThinkingStep(step: ThinkingStep, task: string): Promise<void> {
+
         const request: ChatCompletionCreateParamsNonStreaming = {
             model: step.model,
             messages: [
                 {
                     role: "system",
-                    content: this.getSystemPrompt(task, step)
+                    content: this.getSystemPrompt(step)
                 },
                 ...this.messagesHistory.map((m: ChatCompletionMessageParam) => {
                     // remove non-text content from user messages
-                    if (m.role === 'user' && Array.isArray(m.content)) {
+                    if (m.role === 'user') {
                         return {
                             role: m.role,
-                            content: m.content.filter(c => c.type === 'text')
+                            content: Array.isArray(m.content) ? m.content.filter(c => c.type === 'text') : m.content
                         }
                     }
                     return m;
                 }),
-                ...(userMessageGenerated => {
-                    if(userMessage.content.length) {
-                        return [userMessageGenerated];
-                    }
-                    return [];
-                })(userMessage)
             ],
             max_tokens: 1000,
             temperature: 0.3
         };
 
-        if (this.allowsFunctionCalling(step.model)) {
-            request.tools = step.tools.map(t => t.toolDefinition);
-        }
-        console.log('Sending request');
-        const response = await Agent.client.chat.completions.create(request);
-
-        if(!step.tools.length) {
-            this.messagesHistory.push({
-                role: "assistant",
-                content: response.choices[0]?.message.content
+        if (step.userMessageFactory && step.appendUserMessage && await step.appendUserMessage()) {
+            request.messages.push({
+                role: "user",
+                content: await step.userMessageFactory(task)
             });
-            console.log('Assistant:', response.choices[0]?.message.content);
+        }
+
+        const response = await Agent.client.chat.completions.create(request);
+        const responseContent = response.choices[0]?.message.content || 'Could not get content';
+        if (!step.callback) {
             return;
         }
+        return step.callback instanceof Promise ? await step.callback(responseContent) : step.callback(responseContent);
+    }
 
+    async runExecutionStep(step: ExecutionStep, task: string): Promise<any> {
+        const request: ChatCompletionCreateParamsNonStreaming = {
+            model: step.model,
+            messages: [
+                {
+                    role: "system",
+                    content: this.getSystemPrompt(step)
+                },
+                ...this.messagesHistory.map((m: ChatCompletionMessageParam) => {
+                    // remove non-text content from user messages
+                    if (m.role === 'user') {
+                        return {
+                            role: m.role,
+                            content: Array.isArray(m.content) ? m.content.filter(c => c.type === 'text') : m.content
+                        }
+                    }
+                    return m;
+                }),
+            ],
+            max_tokens: 1000,
+            temperature: 0.3
+        };
+        if (step.userMessageFactory && step.appendUserMessage && await step.appendUserMessage()) {
+            request.messages.push({
+                role: "user",
+                content: await step.userMessageFactory(task)
+            });
+        }
+        if (this.allowsFunctionCalling(step.model)) {
+            request.tools = step.tools.map(t => t.toolDefinition);
+            request.tool_choice = 'auto';
+        }
+        const response = await Agent.client.chat.completions.create(request);
         const selection = this.resolveToolSelection(response, !this.allowsFunctionCalling(step.model as string));
+        if(!selection) {
+            console.log('No selection found for', response.choices[0]?.message.content);
+            throw new Error('No selection found');
+        }
         const tool = step.tools.find(tool => tool.toolDefinition.function.name === selection.actionName);
         if (tool) {
             this.messagesHistory.push({
@@ -230,11 +285,8 @@ export class Agent {
             });
             if (selection.actionName === 'finish') {
                 console.log('Task completed');
-                console.log('/////////////////////////////');
-                this.selectionHistory = [];
-                const fs = require('fs');
-                fs.writeFileSync('output.json', JSON.stringify(this.messagesHistory, null, 2));
-                return;
+                this.messagesHistory = [];
+                return await tool.callback(selection.params);
             }
             console.log('Executing tool', `${tool.toolDefinition.function.name}(${JSON.stringify(selection.params)})`)
             await tool.callback(selection.params);
@@ -244,6 +296,9 @@ export class Agent {
     }
 
     shouldSkipStep(step: Step): boolean {
+        if (step.frequency === StepFrequency.IF) {
+            return !step.frequencyParam();
+        }
         switch (step.frequency) {
             case StepFrequency.FIRST:
                 return this.reasoningCycle !== 1;
@@ -275,48 +330,54 @@ export class Agent {
         });
     }
 
-    getStructuredMdContent(structuredContent: StructuredSystemPrompt, depth: number = 1): string {
+    static getStructuredMdContent(structuredContent: StructuredContent, depth: number = 1): string {
         const MAX_DEPTH = 3;
         let content = '';
 
         for (const key in structuredContent) {
             const value = structuredContent[key];
+            content += `${'#'.repeat(depth > MAX_DEPTH ? MAX_DEPTH : depth)} ${key}\n`;
             if (typeof value === 'string') {
-                content += `${'#'.repeat(depth > MAX_DEPTH ? MAX_DEPTH : depth)} ${key}\n`;
+                content += value + '\n\n';
+            } else {
                 content += (() => {
                     if (typeof value === 'object') {
-                        return Array.isArray(value) ? (value as string[]).map((v, i) => `${i + 1}. ${v}`).join('\n') : this.getStructuredMdContent(value as StructuredSystemPrompt, depth + 1);
+                        return Array.isArray(value) ? (value as string[]).map((v, i) => `${i + 1}. ${v}`).join('\n') : Agent.getStructuredMdContent(value as StructuredContent, depth + 1);
                     }
+                    return value;
                 })()
-            } else {
-                
             }
         }
         return content;
     }
 
-    getSystemPrompt(task: string, step: ExecutionStep): string {
-        return `${typeof step.systemMessage === 'string' ? step.systemMessage : this.getStructuredMdContent(step.systemMessage as StructuredSystemPrompt)}
+    getFilledTemplate(template: string, data: Record<string, string>): string {
+        return template.replace(/{{\s*([^}]+)\s*}}/g, (match, key) => {
+            return data[key] || '';
+        });
+    }
 
-        ## Given task
-        ${task}
-                
-        ${(!this.allowsFunctionCalling(step.model)) && step.tools.length ? `## You can use the following tools to complete the task
-        ${JSON.stringify(step.tools, null, 2) }
-        
-        Only respond using function calling as a JSON object, for example:
-        \`\`\`json
-        {
-            "name": "navigate",
-            "arguments": {
-                "url": "https://www.google.com"
-            }
+    getSystemPrompt(step: Step): string {
+        return this.getFilledTemplate([
+            typeof step.systemMessage === 'string' ? step.systemMessage : Agent.getStructuredMdContent({
+                ...step.systemMessage,
+            }),
+            this.resolveToolDescription(step),
+        ].join('\n'), {...this.records, task: this.currentTask});
+    }
+
+    resolveToolDescription(step: Step): string {
+        if (step.stepType === StepType.EXECUTION && !this.allowsFunctionCalling(step.model)) {
+            return Agent.getStructuredMdContent({
+                ['You can use the following tools to complete the task']: JSON.stringify((step as ExecutionStep).tools, null, 2),
+                ['Only respond using function calling as a JSON object, for example:']: '```json\n{\n  "name": "toolName",\n  "params": {\n    "param1": "value1",\n    "param2": "value2"\n  }\n}\n```'
+            })
+        } else if (step.stepType === StepType.EXECUTION) {
+            return Agent.getStructuredMdContent({
+                ['Expected response']: 'Do not respond with text, only respond using function calling',
+            });
         }
-        \`\`\`` : ''}
-    `
+        return '';
     }
 
 }
-
-
-

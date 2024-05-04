@@ -1,7 +1,7 @@
-import { BrowserNavigatorAgent } from './src/agents/general-browser.agent';
+import { GeneralAgent } from "./src/agents/core-agent.agent";
 
 (async _=> {
-    const agent = new BrowserNavigatorAgent();
-    await agent.run()
+    const agent = new GeneralAgent();
+    await agent.runFromCli()
 })()
 
